@@ -1,0 +1,4 @@
+interface:
+  display_name: "Arcaea Update Publisher"
+  short_description: "Prepare, publish, and promote version-aware Arcaea update posts for Tencent Channel"
+  default_prompt: "Use $arcaea-update-publisher to collect new Arcaea update dynamics, detect versions and topics, merge related items, prepare Tencent Channel drafts with images, publish or append eligible update posts automatically, then set essence, push essence notification when eligible, and pin the post."
