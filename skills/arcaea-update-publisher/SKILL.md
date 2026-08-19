@@ -1,6 +1,6 @@
 ---
 name: arcaea-update-publisher
-description: Use when collecting current or future Arcaea update dynamics from Bilibili, detecting versions and update topics, merging related posts into long-form Tencent Channel drafts with source images, automatically publishing or appending eligible update posts to the Tencent Channel “更新情报” board, and recording handled source dynamics.
+description: Use when collecting current or future Arcaea update dynamics from Bilibili, detecting versions and update topics, merging related posts into Markdown long-form Tencent Channel drafts with interleaved source images, automatically publishing or appending eligible update posts to the Tencent Channel “更新情报” board, and recording handled source dynamics.
 metadata: {"openclaw":{"emoji":"🎵"}}
 ---
 
@@ -37,6 +37,8 @@ Treat Tencent Channel IDs, cookies, and tokens as execution-only data. Do not ec
 - Auto-editing is restricted to `append_existing` actions produced by `plan_version_append.py` whose target is already present in `arcaea_update_post_registry.json`.
 - Do not auto-publish or auto-edit if the manifest has no groups, an action has manual-review warnings, source images referenced by the manifest are missing, Tencent login is invalid, the target post detail cannot be fetched, the target post is not Markdown when a Markdown append is required, or the draft exceeds Tencent limits.
 - Do not auto-delete, move, comment, reply, like, manage members, modify channels, or operate outside the configured update board.
+- New update posts with source images must be Markdown long posts by default. Use plain-text long posts only when there are no source images or when a user explicitly asks for plain text.
+- For multiple new-post candidates that belong to the same version/release window, merge them into one Markdown long post instead of publishing separate small posts.
 - After every successful publish or edit, verify the board list, run the configured post-promotion workflow, update `arcaea_update_post_registry.json` when needed, and mark the source dynamics as handled.
 - If an auto-publish or auto-edit step fails after the documented retry path, stop and report the exact pending action instead of trying alternate public actions.
 
@@ -45,8 +47,11 @@ Treat Tencent Channel IDs, cookies, and tokens as execution-only data. Do not ec
 The current Tencent Channel workflow supports iterative Markdown posts:
 
 - Long Markdown posts can place images at specific positions using `[(0,N)](@img)` placeholders and ordered `--image` arguments.
+- For Arcaea update posts, place each text block next to its corresponding image: section text, then the matching `[(0,N)](@img)` placeholder, then a Markdown separator such as `---` before the next section.
+- Do not duplicate the Tencent long-post title as a top-level Markdown H1 in the body. The post title already renders separately; start the Markdown body with an intro sentence or a `##` section.
 - Existing Tencent Channel posts can be edited with `tencent-channel-cli feed alter-feed`.
 - Markdown posts must be edited with `--markdown-content`; plain-text posts must use `--content` or `--content-file`.
+- A plain-text Tencent post cannot be converted in place to Markdown with `alter-feed --markdown-content`. If a post was accidentally published in plain-text mode, publish and verify a Markdown replacement first, then delete the old plain-text post only after explicit user confirmation.
 - Media replacement during edit should use `--clear-images` / `--clear-videos` before appending the replacement media.
 - If only appending new images to the end of an existing Markdown post, keep original media in place and start new image placeholders from the current `image_count`.
 
@@ -145,13 +150,16 @@ If old media must be deleted or reordered, use `--clear-images` and re-upload ev
 Review every group before publishing or editing:
 
 - Sort source dynamics from old to new.
-- Merge dynamics that describe the same update into one long post.
+- Merge dynamics that describe the same update, version, or release window into one long Markdown post.
 - Give every long post a clear title.
+- Keep the title in the Tencent title field only; do not repeat it as `# title` in Markdown content.
 - Remove Bilibili topic tags from long posts.
 - Keep original image files whenever possible.
 - If one source dynamic has no image, do not invent an image; only use images from related source dynamics.
+- Keep each source image near the text it illustrates. Do not put all text in one block and all images at the end.
+- Use `##` headings for sections and `---` between major sections when a merged post contains several update topics.
 - Check that the version, title, date, topic, and image really refer to the same update being posted.
-- Avoid naked URLs in Tencent post content; use `--link url|原动态` or inline link syntax when publishing.
+- Avoid naked URLs in Tencent post content; use inline Markdown links such as `[原动态 1](https://t.bilibili.com/...)` in Markdown posts, or `--link url|原动态` for plain-text posts.
 
 When the script output needs manual adjustment, edit the generated `.txt` draft files and use the manifest paths as the source of truth for images and source links.
 
@@ -173,7 +181,21 @@ When a future release uses unusual wording, prefer editing `/Users/mikusc/Docume
 
 Use the `tencent-channel-community` skill for all Tencent Channel operations. Verify CLI availability and token state if the current session has not already done so.
 
-For a new long post, use `publish-feed` with the production IDs, title, content file or Markdown body, source links, and images:
+For a new long post, prefer Markdown mode with interleaved source images. The Markdown body should not start with the same title as the Tencent title field:
+
+```bash
+tencent-channel-cli feed publish-feed \
+  --guild-id 63281101636793373 \
+  --channel-id 685837281 \
+  --title "Arcaea v6.15 更新情报" \
+  --markdown-content "Arcaea v6.15 将于 **2026年6月25日** 带来以下更新。\n\n## 主题一\n\n正文段落。\n\n[(0,0)](@img)\n\n---\n\n## 主题二\n\n正文段落。\n\n[(0,1)](@img)\n\n来源：[原动态 1](https://t.bilibili.com/源动态ID)" \
+  --image "/path/to/image1.jpg" \
+  --image "/path/to/image2.jpg"
+```
+
+Use multiple inline source links when a merged Markdown post has multiple source dynamics. Use multiple `--image` flags for all selected images, in the same order as the `[(0,N)](@img)` placeholders.
+
+Use plain text only for image-free posts or when explicitly requested:
 
 ```bash
 tencent-channel-cli feed publish-feed \
@@ -181,33 +203,18 @@ tencent-channel-cli feed publish-feed \
   --channel-id 685837281 \
   --title "帖子标题" \
   --content-file "/path/to/draft.txt" \
-  --image "/path/to/image1.jpg" \
-  --image "/path/to/image2.jpg" \
   --link "https://t.bilibili.com/源动态ID|原动态"
-```
-
-Use multiple `--link` flags when a merged post has multiple source dynamics. Use multiple `--image` flags for all selected images.
-
-When the post should use inline image placement, prefer Markdown content and placeholders:
-
-```bash
-tencent-channel-cli feed publish-feed \
-  --guild-id 63281101636793373 \
-  --channel-id 685837281 \
-  --title "帖子标题" \
-  --markdown-content "# 标题\n\n正文段落\n\n[(0,0)](@img)\n\n## 后续内容\n\n[(0,1)](@img)" \
-  --image "/path/to/image1.jpg" \
-  --image "/path/to/image2.jpg"
 ```
 
 After publishing or editing:
 
 1. Capture and report the Tencent Channel share link.
 2. Verify the latest board list with `get-channel-timeline-feeds`.
-3. For a new version post, add or update its entry in `arcaea_update_post_registry.json`.
-4. For an edited existing version post, update its `image_count`, `source_ids`, `updated_at`, and `share_url` if changed.
-5. Run the post-promotion workflow below.
-6. Mark handled source IDs:
+3. Fetch the post detail with `get-feed-detail` and verify `is_markdown=true` / `sourceMarkdown` or `source_markdown` is present for Markdown posts, and that `image_count` matches the placeholder count.
+4. For a new version post, add or update its entry in `arcaea_update_post_registry.json`, including `publish_mode: "markdown"`, `is_markdown: true`, `image_count`, `content_file`, fallback image paths if used, and any replaced/deleted plain-text post metadata.
+5. For an edited existing version post, update its `image_count`, `source_ids`, `updated_at`, and `share_url` if changed.
+6. Run the post-promotion workflow below.
+7. Mark handled source IDs:
 
 ```bash
 python3 /Users/mikusc/.codex/skills/arcaea-update-publisher/scripts/prepare_arcaea_update_drafts.py \
@@ -262,7 +269,7 @@ For the same-version update model, the daily automation should:
 - run `prepare_arcaea_update_drafts.py` for unhandled recent dynamics;
 - when groups exist, run `plan_version_append.py` against the generated manifest;
 - execute eligible `append_existing` actions by fetching the target Markdown source, appending the generated block, and running `alter-feed`;
-- execute eligible `new_post` actions with `publish-feed`, using Markdown mode when the draft contains Markdown syntax or inline image placement;
+- execute eligible `new_post` actions with `publish-feed` as Markdown long posts when source images exist, using section text followed by matching `[(0,N)](@img)` placeholders;
 - after successful publish/edit, run `set-feed-essence`, `push-essence-feed` when not already pushed, and `top-feed`;
 - report target post title/share URL, append or new-post title, image count, source links, verification result, promotion result, registry update, and handled-state update;
 - leave any blocked or manual-review action unpublished and report the exact reason.
@@ -275,6 +282,8 @@ For the same-version update model, the daily automation should:
 - Tencent rate limit: follow `tencent-channel-community` retry rules.
 - Image upload may fail even when Markdown syntax is correct. A common failure mode is Tencent image slice upload EOF / `retcode=-1` during `publish-feed` or `alter-feed`; do not treat this as a Markdown placeholder failure.
 - Image upload retry strategy: retry once with the same image set if it looks transient; if it fails again, replace or compress the largest image first; keep image order stable because `[(0,N)](@img)` depends on ordered `--image` arguments.
-- Image upload fails or looks compressed: retry with original image first. If needed, create a fallback copy with `sips -Z 1600 --setProperty format jpeg --setProperty formatOptions 92 input -o output.jpg`, then `1280` if necessary. Do not switch to the test channel from an automation run.
+- Image upload fails or looks compressed: retry with original image first. If needed, create fallback copies with `sips -Z 1600 --setProperty format jpeg --setProperty formatOptions 92 input -o output.jpg`, then `1280`, then `960` when Tencent slice upload still returns EOF. Keep image order stable.
 - The same upload retry rules apply to `alter-feed` when replacing or appending images.
+- If a Markdown post was created without bound images, do not treat `sourceMarkdown` alone as success. Verify `image_count` and the board list images. If needed, edit the Markdown post with `--clear-images` and compressed local images until the images bind.
+- If correcting an already public plain-text post, never delete it before the Markdown replacement has been published, verified as Markdown, and verified with the expected images. Delete the old post only after explicit user confirmation, then update registry `replaced_post` metadata.
 - Draft exceeds Tencent limits: stop, explain the limit, and leave the split decision for a manual follow-up; do not auto-publish split posts.
