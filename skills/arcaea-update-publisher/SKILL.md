@@ -76,6 +76,8 @@ python3 scripts/plan_version_append.py \
 
 The planner preserves text/image interleaving and cumulatively offsets placeholders when several groups target the same existing post. Execute same-target actions in plan order; after any skipped or failed action, rebuild the plan before continuing. Exact version matches may be eligible automatically; date-only or multiple matches must remain manual review.
 
+For a new version with several groups, only the first group can be a new post. Later groups are blocked as `replan_after_publish`: verify and record the first post, prepare the remaining unhandled sources, then rebuild the plan. Appends exceeding 50 total images are also blocked; manual approval does not override these errors.
+
 ## Hard publish gates
 
 Do not publish or edit unless all apply:

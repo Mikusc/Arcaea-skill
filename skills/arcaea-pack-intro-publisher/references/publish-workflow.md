@@ -86,7 +86,7 @@ python3 scripts/record_pack_publish.py \
   --is-markdown --verified
 ```
 
-plan 含人工复核理由时额外传 `--manual-review-approved`。更新已有帖使用 `--operation edit`，必要时用 `--registry-key` 保持原 registry key。
+plan 含人工复核理由时额外传 `--manual-review-approved`。更新已有帖使用 `--operation edit`，必要时用 `--registry-key` 保持原 registry key；该 key 必须已有原帖记录，且频道、版块、帖子 ID、创建时间全部匹配。`publish` 不能覆盖既有 key，目标不一致时先回读排查。
 
 ## 5. 用户侧结果
 

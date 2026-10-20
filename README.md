@@ -21,8 +21,8 @@
 
 ## 两个 Skill
 
-- **`arcaea-update-publisher`**：读取 Arcaea 官方 Bilibili 动态，按版本与主题生成图文草稿；已有同版本帖子采用追加计划。支持缓存回放，旧的直接标记已处理路径会拒绝执行。
-- **`arcaea-pack-intro-publisher`**：围绕曲包、歌曲、搭档与解锁信息整理有来源的介绍；校验图片角色、顺序及正文，再生成绑定内容哈希和目标频道的发布计划。
+- **`arcaea-update-publisher`**：读取 Arcaea 官方 Bilibili 动态，按版本与主题生成图文草稿；已有同版本帖子采用追加计划。同一新版本有多组时，仅首组可建帖，其余组必须在首帖发布并记录后重新规划；追加后整帖图片超过 50 张会拒绝计划。支持缓存回放，旧的直接标记已处理路径会拒绝执行。
+- **`arcaea-pack-intro-publisher`**：围绕曲包、歌曲、搭档与解锁信息整理有来源的介绍；校验图片角色、顺序及正文，再生成绑定内容哈希和目标频道的发布计划。记录编辑结果时核对原帖的频道、版块、帖子 ID 和创建时间，新帖操作不能覆盖既有记录。
 
 `legacy/` 保留早期工作流供查阅，当前入口为上述两个 Skill。
 
@@ -37,7 +37,7 @@ python3 -m unittest discover -s skills/arcaea-update-publisher/tests -v
 python3 -m unittest discover -s skills/arcaea-pack-intro-publisher/tests -v
 ```
 
-测试使用临时目录和合成图片，覆盖草稿准备、同版本追加、回读后的状态记录、内容哈希变化、图片占位符错误及目标频道不一致。GitHub Actions 同样只运行这些离线检查。
+测试使用临时目录和合成图片，覆盖草稿准备、同版本追加、新版本多组重规划、整帖图片上限、回读后的状态记录、内容哈希变化、图片占位符错误及帖子身份不一致。GitHub Actions 同样只运行这些离线检查。
 
 ## 使用与配置
 

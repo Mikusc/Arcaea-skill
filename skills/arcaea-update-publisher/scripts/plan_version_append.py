@@ -17,6 +17,7 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = 2
+MAX_IMAGES = 50
 DEFAULT_REGISTRY = "arcaea_update_post_registry.json"
 DEFAULT_OUT_DIR = "arcaea_update_append_plans"
 REQUIRED_TARGET_FIELDS = ("guild_id", "channel_id", "feed_id", "create_time", "image_count")
@@ -205,6 +206,7 @@ def main() -> None:
         "warnings": [],
     }
     target_sequences: dict[str, dict] = {}
+    new_version_groups: dict[str, str] = {}
 
     for group in manifest.get("groups") or []:
         group_key = str(group.get("key") or "")
@@ -265,18 +267,24 @@ def main() -> None:
                     action["warnings"].append(
                         "a preceding action for this post requires manual review"
                     )
-                append_path.write_text(
-                    build_append_block(
-                        group,
-                        image_offset,
-                        include_heading=match_reason == "version",
-                    ),
-                    encoding="utf-8",
-                )
-                action["append_markdown_file"] = str(append_path)
                 action["placeholder_offset"] = image_offset
                 action["depends_on_group_keys"] = dependencies
                 action["expected_image_count_after"] = image_offset + action["image_count"]
+                if action["expected_image_count_after"] > MAX_IMAGES:
+                    errors.append(
+                        f"append would exceed Tencent long-post image limit: "
+                        f"{action['expected_image_count_after']} > {MAX_IMAGES}"
+                    )
+                else:
+                    append_path.write_text(
+                        build_append_block(
+                            group,
+                            image_offset,
+                            include_heading=match_reason == "version",
+                        ),
+                        encoding="utf-8",
+                    )
+                    action["append_markdown_file"] = str(append_path)
                 sequence["next_image_offset"] = action["expected_image_count_after"]
                 sequence["group_keys"].append(group_key)
                 sequence["has_manual_review"] = bool(
@@ -286,8 +294,17 @@ def main() -> None:
             action["target"] = target
         elif len(candidate_keys) > 1:
             action["action"] = "manual_review"
+        elif version and version in new_version_groups:
+            action["action"] = "replan_after_publish"
+            action["depends_on_group_keys"] = [new_version_groups[version]]
+            errors.append(
+                f"version {version} already has a new-post action; publish and record "
+                f"group {new_version_groups[version]}, then rebuild the plan"
+            )
         else:
             action["action"] = "new_post"
+            if version:
+                new_version_groups[version] = group_key
 
         action["requires_manual_review"] = requires_manual_review
         action["warnings"] = list(dict.fromkeys(action["warnings"]))

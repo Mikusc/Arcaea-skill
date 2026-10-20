@@ -92,6 +92,14 @@ def record(args: argparse.Namespace) -> dict:
     if not isinstance(posts, dict):
         posts = {}
     existing = posts.get(key) if isinstance(posts.get(key), dict) else {}
+    if args.operation == "edit":
+        target_fields = ("guild_id", "channel_id", "feed_id", "create_time")
+        if not existing or any(
+            str(existing.get(field) or "") != str(getattr(args, field)) for field in target_fields
+        ):
+            raise RuntimeError("refusing to record edit: verified target does not match registry")
+    elif existing:
+        raise RuntimeError("refusing to replace an existing pack record: use edit for the same post")
     entry = dict(existing)
     entry.update(
         {

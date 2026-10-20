@@ -168,6 +168,62 @@ class PackPlanTest(unittest.TestCase):
         self.assertFalse(plan["draft_ready"])
         self.assertTrue(any("placeholders" in error for error in plan["errors"]))
 
+    def test_record_edit_requires_existing_post_identity(self) -> None:
+        self.build_valid_plan()
+        registry_path = self.workspace / "pack_intro_post_registry.json"
+        existing = {
+            "guild_id": "g", "channel_id": "c", "feed_id": "original",
+            "create_time": "1", "promotion_status": "promoted",
+        }
+        registry_text = json.dumps({"posts": {"Test曲包介绍": existing}})
+        record_args = [
+            str(RECORDER), "--workspace", str(self.workspace), "--plan", str(self.plan),
+            "--operation", "edit", "--guild-id", "g", "--channel-id", "c",
+            "--feed-id", "original", "--create-time", "1",
+            "--share-url", "https://pd.qq.com/s/test", "--image-count", "2",
+            "--is-markdown", "--verified",
+        ]
+        missing = run(*record_args, expect_ok=False)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertFalse(registry_path.exists())
+        for field, value in (("feed_id", "different"), ("create_time", "2"),
+                             ("guild_id", "other-guild"), ("channel_id", "other-board")):
+            with self.subTest(field=field):
+                mismatched = dict(existing, **{field: value})
+                before = json.dumps({"posts": {"Test曲包介绍": mismatched}})
+                registry_path.write_text(before)
+                result = run(*record_args, expect_ok=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("target does not match registry", result.stderr)
+                self.assertEqual(registry_path.read_text(), before)
+
+        registry_path.write_text(registry_text)
+        run(*record_args)
+        recorded = json.loads(registry_path.read_text())["posts"]["Test曲包介绍"]
+        self.assertEqual(recorded["feed_id"], "original")
+        self.assertEqual(recorded["create_time"], "1")
+        self.assertEqual(recorded["promotion_status"], "promoted")
+        self.assertEqual(recorded["publication_operation"], "edit")
+
+    def test_publish_cannot_overwrite_existing_pack_record(self) -> None:
+        self.build_valid_plan()
+        registry_path = self.workspace / "pack_intro_post_registry.json"
+        before = json.dumps({"posts": {"Test曲包介绍": {
+            "guild_id": "g", "channel_id": "c", "feed_id": "original",
+            "create_time": "1", "promotion_status": "promoted",
+        }}})
+        registry_path.write_text(before)
+        result = run(
+            str(RECORDER), "--workspace", str(self.workspace), "--plan", str(self.plan),
+            "--operation", "publish", "--guild-id", "g", "--channel-id", "c",
+            "--feed-id", "new-post", "--create-time", "2",
+            "--share-url", "https://pd.qq.com/s/test", "--image-count", "2",
+            "--is-markdown", "--verified", expect_ok=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("existing pack record", result.stderr)
+        self.assertEqual(registry_path.read_text(), before)
+
     def test_record_rejects_changed_draft_hash(self) -> None:
         self.build_valid_plan()
         self.draft.write_text(self.draft.read_text(encoding="utf-8") + "\nchanged\n", encoding="utf-8")

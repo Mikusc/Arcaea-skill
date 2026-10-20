@@ -217,6 +217,84 @@ class UpdatePipelineTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("disabled", result.stderr)
 
+    def test_new_version_topics_require_record_then_replan(self) -> None:
+        pages = json.loads(self.raw.read_text(encoding="utf-8"))
+        another = json.loads(json.dumps(pages[0]["data"]["items"][0]))
+        another["id_str"] = "1003"
+        another["modules"]["module_author"]["pub_ts"] = 1787000600
+        another["modules"]["module_dynamic"]["desc"]["text"] = (
+            "Arcaea v6.99 将于2026年8月20日新增新曲「Another Song」"
+        )
+        pages[0]["data"]["items"].append(another)
+        self.raw.write_text(json.dumps(pages, ensure_ascii=False), encoding="utf-8")
+        run(str(PREPARE), "--workspace", str(self.workspace), "--raw-file", str(self.raw),
+            "--out-dir", "drafts")
+        manifest_path = self.workspace / "drafts" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(len(manifest["groups"]), 2)
+        run(str(PLANNER), "--workspace", str(self.workspace), "--manifest", str(manifest_path))
+        plan_path = self.workspace / "arcaea_update_append_plans" / "append_plan.json"
+        plan = json.loads(plan_path.read_text())
+        first, second = plan["actions"]
+        self.assertEqual(first["action"], "new_post")
+        self.assertTrue(first["eligible_for_publish"])
+        self.assertEqual(second["action"], "replan_after_publish")
+        self.assertFalse(second["eligible_for_publish"])
+        self.assertEqual(second["depends_on_group_keys"], [first["group_key"]])
+        self.assertTrue(second["errors"])
+        self.assertFalse(plan["draft_ready"])
+
+        run(str(RECORDER), "--workspace", str(self.workspace), "--manifest", str(manifest_path),
+            "--group-key", first["group_key"], "--operation", "publish",
+            "--guild-id", "g", "--channel-id", "c", "--feed-id", "first-post",
+            "--create-time", "1", "--share-url", "https://pd.qq.com/s/test",
+            "--image-count", str(first["image_count"]), "--is-markdown", "--verified")
+        run(str(PREPARE), "--workspace", str(self.workspace), "--raw-file", str(self.raw),
+            "--out-dir", "remaining")
+        remaining = self.workspace / "remaining" / "manifest.json"
+        run(str(PLANNER), "--workspace", str(self.workspace), "--manifest", str(remaining))
+        replanned = json.loads(plan_path.read_text())
+        self.assertEqual(len(replanned["actions"]), 1)
+        action = replanned["actions"][0]
+        self.assertEqual(action["action"], "append_existing")
+        self.assertEqual(action["target"]["feed_id"], "first-post")
+        self.assertEqual(action["placeholder_offset"], first["image_count"])
+        self.assertTrue(action["eligible_for_publish"])
+
+    def test_append_image_limit_applies_to_cumulative_post(self) -> None:
+        run(str(PREPARE), "--workspace", str(self.workspace), "--raw-file", str(self.raw),
+            "--out-dir", "drafts")
+        manifest_path = self.workspace / "drafts" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        group = manifest["groups"][0]
+        self.assertEqual(group["image_count"], 2)
+        manifest["groups"] = [
+            dict(group, key=f"v6.99-topic-{index}") for index in range(3)
+        ]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        for existing_count in (48, 49):
+            with self.subTest(existing_count=existing_count):
+                registry = {"posts": {"v6.99": {
+                    "guild_id": "g", "channel_id": "c", "feed_id": "old",
+                    "create_time": "1", "image_count": existing_count,
+                }}}
+                (self.workspace / "arcaea_update_post_registry.json").write_text(json.dumps(registry))
+                out_dir = f"plans-{existing_count}"
+                run(str(PLANNER), "--workspace", str(self.workspace),
+                    "--manifest", str(manifest_path), "--out-dir", out_dir)
+                plan = json.loads((self.workspace / out_dir / "append_plan.json").read_text())
+                self.assertFalse(plan["draft_ready"])
+                for index, action in enumerate(plan["actions"]):
+                    expected_count = existing_count + 2 * (index + 1)
+                    self.assertEqual(action["expected_image_count_after"], expected_count)
+                    if expected_count == 50:
+                        self.assertTrue(action["eligible_for_publish"])
+                        self.assertTrue(Path(action["append_markdown_file"]).is_file())
+                    else:
+                        self.assertFalse(action["eligible_for_publish"])
+                        self.assertTrue(any("image limit" in error for error in action["errors"]))
+                        self.assertNotIn("append_markdown_file", action)
+
 
 if __name__ == "__main__":
     unittest.main()
