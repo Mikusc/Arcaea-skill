@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare merged Arcaea update drafts from Bilibili dynamics.
+"""Prepare verified, publish-ready Arcaea update drafts from Bilibili dynamics.
 
-This script intentionally does not publish anything by itself. It creates draft
-text files, downloads source images, and writes a manifest that a later
-publishing step can use for Tencent Channel posting or editing.
+This script never publishes to Tencent Channel and never marks sources handled.
+It can fetch live Bilibili pages or replay a cached response, then writes
+interleaved Markdown articles and a schema-versioned validation manifest.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import re
-import sys
+import shutil
 import time
 import urllib.error
 import urllib.parse
@@ -26,6 +26,9 @@ API_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
 DEFAULT_UID = "404145357"
 DEFAULT_STATE = ".arcaea_update_publisher_state.json"
 DEFAULT_RULES_FILE = "arcaea_update_rules.json"
+SCHEMA_VERSION = 2
+MAX_MARKDOWN_CHARS = 10_000
+MAX_IMAGES = 50
 
 DEFAULT_RULES = {
     "version_patterns": [
@@ -274,6 +277,15 @@ def fetch_pages(uid: str, pages: int, sleep_seconds: float, cookie: str) -> list
     return out
 
 
+def load_raw_pages(path: Path) -> list[dict]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list) or not all(isinstance(page, dict) for page in data):
+        raise RuntimeError(f"cached Bilibili response must be a JSON object or list of objects: {path}")
+    return data
+
+
 def module_dynamic(item: dict) -> dict:
     return ((item.get("modules") or {}).get("module_dynamic") or {})
 
@@ -323,25 +335,32 @@ def item_images(item: dict) -> list[str]:
     return clean
 
 
-def author_time(item: dict) -> tuple[int, str]:
+def author_info(item: dict) -> tuple[int, str, str, str]:
     author = (item.get("modules") or {}).get("module_author") or {}
     raw = author.get("pub_ts") or 0
     try:
         raw = int(raw)
     except (TypeError, ValueError):
         raw = 0
-    return raw, str(author.get("pub_time") or "")
+    return (
+        raw,
+        str(author.get("pub_time") or ""),
+        str(author.get("mid") or ""),
+        str(author.get("name") or ""),
+    )
 
 
 def simplify_item(item: dict) -> dict:
     text, title = item_text_and_title(item)
-    pub_ts, pub_time = author_time(item)
+    pub_ts, pub_time, author_mid, author_name = author_info(item)
     item_id = str(item.get("id_str") or "")
     return {
         "id": item_id,
         "pub_ts": pub_ts,
         "pub_time": pub_time,
         "type": item.get("type"),
+        "author_mid": author_mid,
+        "author_name": author_name,
         "text": text,
         "title": title,
         "images": item_images(item),
@@ -493,10 +512,137 @@ def merge_text(items: list[dict]) -> str:
     return "\n\n".join(blocks).strip()
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_cached_image(
+    workspace: Path,
+    base: str,
+    ordinal: int,
+    url: str,
+    reuse_dirs: list[str],
+) -> Path | None:
+    suffix = Path(urllib.parse.urlparse(url).path).suffix or ".jpg"
+    for rel in reuse_dirs:
+        root = Path(rel).expanduser()
+        if not root.is_absolute():
+            root = (workspace / root).resolve()
+        if not root.exists():
+            continue
+        expected = root / f"{base}_{ordinal}{suffix}"
+        if expected.is_file():
+            return expected
+        match = next((path for path in sorted(root.glob(f"{base}_{ordinal}*")) if path.is_file()), None)
+        if match:
+            return match
+    return None
+
+
+def prepare_group_images(
+    workspace: Path,
+    out_dir: Path,
+    base: str,
+    items: list[dict],
+    reuse_dirs: list[str],
+) -> tuple[list[dict], list[str]]:
+    records: list[dict] = []
+    errors: list[str] = []
+    seen_urls: set[str] = set()
+    ordinal = 0
+    for item in items:
+        item["_image_indexes"] = []
+        for url in item.get("images") or []:
+            url = str(url)
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            ordinal += 1
+            suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+            if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+                suffix = ".jpg"
+            image_path = out_dir / f"{base}_{ordinal}{suffix}"
+            try:
+                if not image_path.exists():
+                    cached = find_cached_image(workspace, base, ordinal, url, reuse_dirs)
+                    if cached:
+                        shutil.copy2(cached, image_path)
+                    else:
+                        download(url, image_path)
+                if not image_path.is_file() or image_path.stat().st_size == 0:
+                    raise RuntimeError("downloaded file is empty")
+            except Exception as exc:
+                errors.append(f"source {item.get('id')}: failed to prepare image {url}: {exc}")
+                continue
+            placeholder_index = len(records)
+            item["_image_indexes"].append(placeholder_index)
+            records.append(
+                {
+                    "placeholder_index": placeholder_index,
+                    "source_id": str(item.get("id") or ""),
+                    "url": url,
+                    "file": str(image_path),
+                    "sha256": sha256_file(image_path),
+                }
+            )
+    return records, errors
+
+
+def compose_article(items: list[dict]) -> str:
+    blocks: list[str] = []
+    for source_number, item in enumerate(items, start=1):
+        lines: list[str] = []
+        text = clean_for_long_post(item.get("text") or item.get("title") or "")
+        if text:
+            lines.append(text)
+        for placeholder_index in item.get("_image_indexes") or []:
+            lines.append(f"[(0,{placeholder_index})](@img)")
+        source_url = str(item.get("source_url") or "")
+        if source_url:
+            lines.append(f"[原动态 {source_number}]({source_url})")
+        if lines:
+            blocks.append("\n\n".join(lines))
+    return "\n\n---\n\n".join(blocks).strip() + "\n"
+
+
+def validate_article(article: str, items: list[dict], image_records: list[dict]) -> list[str]:
+    errors: list[str] = []
+    indexes = [int(value) for value in re.findall(r"\[\(0,(\d+)\)\]\(@img\)", article)]
+    expected = list(range(len(image_records)))
+    if indexes != expected:
+        errors.append(f"image placeholders are not continuous: found={indexes} expected={expected}")
+    if re.search(r"^# ", article, flags=re.MULTILINE):
+        errors.append("Markdown body contains a top-level H1")
+    if len(article) > MAX_MARKDOWN_CHARS:
+        errors.append(f"Markdown body exceeds {MAX_MARKDOWN_CHARS} characters: {len(article)}")
+    if len(image_records) > MAX_IMAGES:
+        errors.append(f"image count exceeds Tencent long-post limit: {len(image_records)}")
+    if not article.strip():
+        errors.append("Markdown body is empty")
+    linked_source_ids = set(re.findall(r"https://t\.bilibili\.com/(\d+)", article))
+    expected_source_ids = {str(item.get("id") or "") for item in items if item.get("id")}
+    if linked_source_ids != expected_source_ids:
+        errors.append("Markdown source links do not match group source IDs")
+    for record in image_records:
+        path = Path(str(record.get("file") or ""))
+        if not path.is_file():
+            errors.append(f"missing image file: {path}")
+    return errors
+
+
 def load_state(path: Path) -> dict:
     if not path.exists():
-        return {"handled_ids": []}
-    return json.loads(path.read_text(encoding="utf-8"))
+        return {"schema_version": SCHEMA_VERSION, "handled_ids": []}
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(state, dict):
+        raise RuntimeError(f"state file must contain a JSON object: {path}")
+    state.setdefault("schema_version", SCHEMA_VERSION)
+    state.setdefault("handled_ids", [])
+    return state
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -511,25 +657,11 @@ def safe_key(text: str) -> str:
     return f"topic-{digest}"
 
 
-def mark_handled(state_file: Path, manifest_path: Path) -> None:
-    state = load_state(state_file)
-    handled = set(map(str, state.get("handled_ids") or []))
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    handled_groups = state.get("handled_groups") or []
-    marked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for group in manifest.get("groups") or []:
-        for item_id in group.get("source_ids") or []:
-            handled.add(str(item_id))
-        handled_groups.append({
-            "key": group.get("key"),
-            "title": group.get("title"),
-            "source_ids": group.get("source_ids") or [],
-            "marked_at": marked_at,
-        })
-    state["handled_ids"] = sorted(handled)
-    state["handled_groups"] = handled_groups[-200:]
-    state["last_marked_at"] = marked_at
-    save_state(state_file, state)
+def reject_legacy_mark_handled() -> None:
+    raise RuntimeError(
+        "--mark-handled is disabled in manifest schema v2; after Tencent timeline/detail verification, "
+        "use record_arcaea_publish.py --verified for exactly one group"
+    )
 
 
 def safe_name(text: str) -> str:
@@ -555,16 +687,32 @@ def prepare(args: argparse.Namespace) -> None:
     version_filter = normalize_version(args.version) if args.version else ""
     since_ts = parse_since(args.since)
 
-    cookie = load_cookie(workspace, args.cookie_file)
-    pages = fetch_pages(args.uid, args.pages, args.sleep, cookie)
+    if args.raw_file:
+        raw_input = Path(args.raw_file).expanduser()
+        if not raw_input.is_absolute():
+            raw_input = (workspace / raw_input).resolve()
+        pages = load_raw_pages(raw_input)
+        source_mode = "cache"
+        source_cache = str(raw_input)
+    else:
+        cookie = load_cookie(workspace, args.cookie_file)
+        pages = fetch_pages(args.uid, args.pages, args.sleep, cookie)
+        source_mode = "live"
+        source_cache = ""
     raw_path = out_dir / "bili_raw_pages.json"
     raw_path.write_text(json.dumps(pages, ensure_ascii=False, indent=2), encoding="utf-8")
 
     items = []
+    skipped_author_mismatch: list[dict] = []
     for page in pages:
         for raw_item in (page.get("data") or {}).get("items") or []:
             item = simplify_item(raw_item)
             if not item.get("id"):
+                continue
+            if item.get("author_mid") and str(item["author_mid"]) != str(args.uid):
+                skipped_author_mismatch.append(
+                    {"source_id": item["id"], "author_mid": item["author_mid"]}
+                )
                 continue
             if not args.include_handled and item["id"] in handled:
                 continue
@@ -601,6 +749,7 @@ def prepare(args: argparse.Namespace) -> None:
             if len(candidates) == 1:
                 key = next(iter(candidates))
                 item["_group_key"] = key
+                item["_merge_reason"] = "unique_subject_version_match"
         elif not meta.get("primary_version") and not meta.get("subject_key") and merge_window and item.get("pub_ts"):
             item_ts = int(item["pub_ts"])
             nearest = min(
@@ -611,6 +760,7 @@ def prepare(args: argparse.Namespace) -> None:
             if nearest and abs(nearest[1] - item_ts) <= merge_window:
                 key = nearest[0]
                 item["_group_key"] = key
+                item["_merge_reason"] = "nearest_version_by_time"
         groups.setdefault(key, []).append(item)
 
     if version_filter:
@@ -622,68 +772,145 @@ def prepare(args: argparse.Namespace) -> None:
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     manifest = {
+        "schema_version": SCHEMA_VERSION,
         "generated_at": generated_at,
-        "uid": args.uid,
+        "uid": str(args.uid),
         "config_file": config_path,
         "version_filter": version_filter,
         "since": args.since or "",
+        "source_mode": source_mode,
+        "source_cache": source_cache,
         "groups": [],
         "raw_pages": str(raw_path),
+        "draft_ready": False,
+        "requires_manual_review": False,
+        "errors": [],
+        "warnings": [],
+        "skipped_author_mismatch": skipped_author_mismatch,
     }
+    if skipped_author_mismatch:
+        manifest["warnings"].append(
+            f"skipped {len(skipped_author_mismatch)} source item(s) whose author UID did not match {args.uid}"
+        )
+    reuse_dirs = [str(value).strip() for value in (args.reuse_image_dir or []) if str(value).strip()]
     for key, group_items in sorted(groups.items(), key=lambda kv: min(x["pub_ts"] for x in kv[1])):
         group_items = sorted(group_items, key=lambda x: x.get("pub_ts") or 0)
         title = group_title(key, group_items)
         body = merge_text(group_items)
         source_links = [x["source_url"] for x in group_items if x.get("source_url")]
         base = safe_name(key)
-        text_path = out_dir / f"{base}.txt"
-        text_path.write_text(body + "\n", encoding="utf-8")
+        legacy_text_path = out_dir / f"{base}.txt"
+        legacy_text_path.write_text(body + "\n", encoding="utf-8")
 
-        image_urls = []
+        image_urls: list[str] = []
         for item in group_items:
             for url in item.get("images") or []:
                 if url not in image_urls:
                     image_urls.append(url)
-        image_files = []
-        for idx, url in enumerate(image_urls, start=1):
-            suffix = Path(urllib.parse.urlparse(url).path).suffix or ".jpg"
-            image_path = out_dir / f"{base}_{idx}{suffix}"
-            if not image_path.exists():
-                try:
-                    download(url, image_path)
-                except Exception as exc:  # keep draft usable if image download fails
-                    print(f"warning: failed to download image {url}: {exc}", file=sys.stderr)
-                    continue
-            image_files.append(str(image_path))
-
-        manifest["groups"].append({
+        image_records, image_errors = prepare_group_images(
+            workspace, out_dir, base, group_items, reuse_dirs
+        )
+        article = compose_article(group_items)
+        article_path = out_dir / f"{base}.article.md"
+        article_path.write_text(article, encoding="utf-8")
+        validation_errors = validate_article(article, group_items, image_records)
+        errors = image_errors + validation_errors
+        versions = unique_values(group_items, "versions") or unique_values(group_items, "primary_version")
+        manual_review_reasons: list[str] = []
+        if len(versions) > 1:
+            manual_review_reasons.append("group contains more than one detected version")
+        if not versions:
+            manual_review_reasons.append("group has no explicit version")
+        if any(item.get("_merge_reason") == "nearest_version_by_time" for item in group_items):
+            manual_review_reasons.append("one or more sources were merged by nearest timestamp")
+        missing_image_urls = [
+            url for url in image_urls if url not in {record["url"] for record in image_records}
+        ]
+        validation_passed = not errors
+        requires_manual_review = bool(manual_review_reasons)
+        group_manifest = {
+            "schema_version": SCHEMA_VERSION,
             "key": key,
             "title": title,
-            "content_file": str(text_path),
-            "image_files": image_files,
+            "content_file": str(article_path),
+            "legacy_content_file": str(legacy_text_path),
+            "content_sha256": sha256_file(article_path),
+            "char_count": len(article),
+            "image_count": len(image_records),
+            "image_files": [record["file"] for record in image_records],
+            "image_urls": image_urls,
+            "missing_image_urls": missing_image_urls,
+            "image_records": image_records,
+            "placeholder_indexes": [record["placeholder_index"] for record in image_records],
             "source_ids": [x["id"] for x in group_items],
             "source_links": source_links,
             "pub_times": [x["pub_time"] for x in group_items],
-            "versions": unique_values(group_items, "versions") or unique_values(group_items, "primary_version"),
+            "versions": versions,
             "subjects": unique_values(group_items, "subject"),
             "matched": unique_values(group_items, "matched"),
-        })
+            "sources": [
+                {
+                    "id": item["id"],
+                    "pub_ts": item["pub_ts"],
+                    "pub_time": item["pub_time"],
+                    "author_mid": item.get("author_mid") or "",
+                    "title": item.get("title") or "",
+                    "text": item.get("text") or "",
+                    "source_url": item.get("source_url") or "",
+                    "images": item.get("images") or [],
+                    "merge_reason": item.get("_merge_reason") or "",
+                    "classification": item.get("_meta") or {},
+                }
+                for item in group_items
+            ],
+            "validation_passed": validation_passed,
+            "draft_ready": validation_passed and not requires_manual_review,
+            "requires_manual_review": requires_manual_review,
+            "manual_review_reasons": manual_review_reasons,
+            "errors": errors,
+            "warnings": [],
+        }
+        manifest["groups"].append(group_manifest)
+        manifest["errors"].extend(f"group {key}: {error}" for error in errors)
+        manifest["warnings"].extend(
+            f"group {key}: {reason}" for reason in manual_review_reasons
+        )
 
+    manifest["group_count"] = len(manifest["groups"])
+    manifest["requires_manual_review"] = any(
+        group.get("requires_manual_review") for group in manifest["groups"]
+    )
+    manifest["draft_ready"] = bool(manifest["groups"]) and not manifest["errors"] and not manifest["requires_manual_review"]
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     state["last_checked_at"] = generated_at
     state["last_manifest"] = str(manifest_path)
+    state["last_source_mode"] = source_mode
+    if source_cache:
+        state["last_cache_source"] = source_cache
     save_state(state_file, state)
-    print(json.dumps({"manifest": str(manifest_path), "group_count": len(manifest["groups"])}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "manifest": str(manifest_path),
+                "group_count": len(manifest["groups"]),
+                "draft_ready": manifest["draft_ready"],
+                "requires_manual_review": manifest["requires_manual_review"],
+                "error_count": len(manifest["errors"]),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare merged Arcaea update drafts.")
+    parser = argparse.ArgumentParser(description="Prepare validated Arcaea update Markdown drafts.")
     parser.add_argument("--workspace", default=".", help="Workspace containing .bili_cookie and state")
     parser.add_argument("--uid", default=DEFAULT_UID, help="Bilibili UID")
     parser.add_argument("--pages", type=int, default=5, help="Recent pages to fetch")
     parser.add_argument("--sleep", type=float, default=3.0, help="Seconds between Bilibili pages")
     parser.add_argument("--cookie-file", help="Optional Bilibili Cookie file")
+    parser.add_argument("--raw-file", help="Use cached Bilibili JSON instead of live fetch")
     parser.add_argument("--state-file", default=DEFAULT_STATE, help="State file relative to workspace")
     parser.add_argument("--out-dir", default="arcaea_update_drafts", help="Draft output dir relative to workspace")
     parser.add_argument("--config", help=f"Rules JSON file; defaults to workspace/{DEFAULT_RULES_FILE} if present")
@@ -692,13 +919,17 @@ def main() -> None:
     parser.add_argument("--ignore-keyword", action="append", default=[], help="Extra ignore keyword; can be repeated")
     parser.add_argument("--since", help="Only collect dynamics at or after a Unix timestamp or date like 2026-04-25")
     parser.add_argument("--include-handled", action="store_true", help="Include source IDs already recorded as handled")
-    parser.add_argument("--mark-handled", help="Manifest path whose source IDs should be marked handled")
+    parser.add_argument(
+        "--reuse-image-dir",
+        action="append",
+        default=[],
+        help="Reuse matching downloaded images from this directory; can be repeated",
+    )
+    parser.add_argument("--mark-handled", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    workspace = Path(args.workspace).expanduser().resolve()
-    state_file = (workspace / args.state_file).resolve()
     if args.mark_handled:
-        mark_handled(state_file, Path(args.mark_handled).expanduser().resolve())
+        reject_legacy_mark_handled()
     else:
         prepare(args)
 

@@ -6,4 +6,15 @@ __pycache__/
 *.cookie
 *.token
 *.secret
+.env.*
+!.env.example
+workspace/
+arcaea_update_drafts/
+arcaea_update_replay/
+arcaea_update_append_plans/
+pack_intro_drafts/
+pack_intro_assets/
+arcaea_update_post_registry.json
+pack_intro_post_registry.json
+.arcaea_update_publisher_state.json
 

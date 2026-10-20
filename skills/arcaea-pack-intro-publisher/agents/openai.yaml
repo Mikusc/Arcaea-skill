@@ -1,0 +1,4 @@
+interface:
+  display_name: "Arcaea Pack Intro Publisher"
+  short_description: "Draft and verify factual Arcaea pack introductions"
+  default_prompt: "Use $arcaea-pack-intro-publisher to prepare and validate a factual Arcaea pack-intro post, then ask for explicit confirmation before any Tencent Channel write."
